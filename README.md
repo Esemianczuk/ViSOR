@@ -1,4 +1,5 @@
-# **ViSOR – *View-Synthesis with Occlusion-aware Refractions***
+# **ViSOR – *View-interpolated Sparse Occlusion Refraction***
+
 
 <p align="center">
   <img src="docs/demo.gif" alt="ViSOR demo" width="100%">
