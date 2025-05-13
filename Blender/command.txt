@@ -1,0 +1,4 @@
+blender synth.blend \
+        --background \
+        --python random.py \
+
