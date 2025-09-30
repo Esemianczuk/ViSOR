@@ -10,7 +10,7 @@ A research-grade *dual-billboard prism* renderer plus helper tools
 
 ---
 
-## ✨  Why “Dual-Billboard Prism”?
+##   Why “Dual-Billboard Prism”?
 
 Unlike NeRFs that march along every ray, ViSOR collapses the scene into **two** textured sheets:
 
@@ -32,7 +32,7 @@ Unlike NeRFs that march along every ray, ViSOR collapses the scene into **two** 
 
 ---
 
-## 🔧  Installation (GPU build)
+##   Installation (GPU build)
 
 ```bash
 # 0 · fresh Conda/venv (Python ≥ 3.9)
@@ -55,7 +55,7 @@ pip install -e .
 ```
 
 
-### 🖥️ Interactive Viewer
+###  Interactive Viewer
 
 Launch the viewer (after you have installed **ViSOR**, your CUDA-enabled
 PyTorch build **and** *tiny-cuda-nn*, and downloaded the demo checkpoint):
