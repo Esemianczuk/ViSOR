@@ -179,4 +179,4 @@ Editable install exposes:
 
 - `runs/`, `long_runs/`, checkpoints, and experiment dumps are intentionally ignored in git.
 - The repo keeps the older SH / MiDaS tooling around for experimentation, but the current core training path does not depend on them.
-- The tracked README GIF is preserved from the original GitHub repo and kept in `docs/demo.gif`.
+
