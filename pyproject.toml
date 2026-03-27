@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]   # cmake / ninja only needed when you build TCNN
+build-backend = "setuptools.build_meta"
+
+[project]
+name            = "visor"
+version         = "0.1.0"
+description     = "Dual-billboard prism renderer & tools"
+authors         = [{ name = "Eric Semianczuk", email = "esemianczuk84@gmail.com" }]
+license         = "Apache-2.0"
+readme          = "README.md"
+requires-python = ">=3.9"
+
+# ─── lightweight, universal wheels only ───
+dependencies = [
+  "numpy>=1.23,<2",
+  "opencv-python>=4.8",
+  "Pillow>=10.0",
+  "imageio>=2.34",
+  "tqdm>=4.66",
+  "matplotlib>=3.7",
+  "pygame>=2.6", 
+  "timm>=0.9.2"                # pure-Python + small wheels
+]
+
+[project.optional-dependencies]
+# Users who **know** they want the CUDA stack can do:  pip install visor[gpu]
+
+dev = ["black", "ruff", "pytest"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["visor*"]
+
+[tool.setuptools.package-data]
+visor = [
+  "renders_barn/**/*",
+  "*.pt",
+  "*.jsonl"
+]
+
+[project.scripts]
+visor-view  = "visor.viewer:main"
+visor-train = "visor.train:main"
+visor-watch = "visor.watch_training_progress:main"
+visor-bake  = "visor.utils.convoror_sh_topk:main"
+visor-depth = "visor.utils.gen_midas_depth:main"

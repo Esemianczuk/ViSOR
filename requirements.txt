@@ -1,0 +1,10 @@
+# Runtime dependencies (PyPI names)
+numpy
+scipy
+matplotlib
+tqdm
+imageio
+opencv-python
+pygame
+Pillow
+timm

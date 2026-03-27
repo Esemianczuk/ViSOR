@@ -1,147 +1,182 @@
-# **ViSOR – *View-interpolated Sparse Occlusion Refraction***
-
+# ViSOR
 
 <p align="center">
   <img src="docs/demo.gif" alt="ViSOR demo" width="100%">
 </p>
 
-A research-grade *dual-billboard prism* renderer plus helper tools  
-(MiDaS depth batching, SH baking, live viewer, etc.).
+ViSOR is a compact view-synthesis project built around learned image-forming sheets instead of a full scene volume. The current version keeps the sheet-based idea, then strengthens it with tri-probe rear transport and a lightweight disagreement-aware Gaussian attenuation slab between the sheets.
 
----
-
-##   Why “Dual-Billboard Prism”?
-
-Unlike NeRFs that march along every ray, ViSOR collapses the scene into **two** textured sheets:
+## Current Model
 
 ```text
-┌────────────────────┐
-│   front  sheet     │   ←  **occlusion layer**  (diffuse ✚ spec ✚ α)
-└────────────────────┘
-        ▲   tiny Δθ refractions
-┌────────────────────┐
-│    rear  sheet     │   ←  **refraction layer** (RGB₀,₁,₂ ✚ α)
-└────────────────────┘
+camera rays
+   |
+   v
+front sheet
+  - front color
+  - front transmission / blocking
+   |
+   v
+rear transport
+  - 3 rear probes on the rear sheet
+  - adaptive routing between rear heads
+   |
+   v
+intra-slab Gaussian attenuation
+  - sparse residual attenuation only where needed
+   |
+   v
+final composite
 ```
 
+This keeps the representation compact while still letting the renderer handle harder cases like partial occlusion, thin structure, and between-view ambiguity.
 
+## Repo Contents
 
-* **80× faster** rendering on commodity GPUs  
-* Baked Real-Spherical-Harmonics keep soft lighting  
-* Hash-grid latents ✕ camera embeddings generalise to new views
+- `visor/train.py`: main training loop for the current sheet + transport + slab model
+- `visor/viewer.py`: interactive viewer with adaptive lower-res motion rendering
+- `visor/analyze_three_ray.py`: exact-pose train / heldout evaluator and ablation runner
+- `visor/watch_training_progress.py`: live preview watcher for checkpoints
+- `Blender/random.py`: Blender-side dataset generator
+- `visor/utils/`: older helper tools for MiDaS depth and SH baking; still available but no longer required for the main training path
 
----
+## Quick Start
 
-##   Installation (GPU build)
+### 1. Create the environment
+
+Use the included environment file:
 
 ```bash
-# 0 · fresh Conda/venv (Python ≥ 3.9)
-conda create -n visor python=3.10 -y
-conda activate visor
+micromamba create -f environment.yml
+```
 
-# 1 · pick Torch wheels that match your driver (CUDA 11.8 example)
-pip install torch==2.1.2+cu118 torchvision==0.16.2+cu118 \
-        --index-url https://download.pytorch.org/whl/cu118
+or:
 
-# 2 · compile tiny-cuda-nn against *that* Torch
-pip install ninja cmake
-pip install --no-build-isolation \
-    "git+https://github.com/NVlabs/tiny-cuda-nn.git@v1.6#subdirectory=bindings/torch"
+```bash
+conda env create -f environment.yml
+```
 
-# 3 · ViSOR itself (lightweight, pure-Python wheel)
-git clone https://github.com/YOURNAME/ViSOR.git
-cd ViSOR
+Then activate it:
+
+```bash
+export MAMBA_ROOT_PREFIX="$HOME/.local/share/visor-micromamba"
+eval "$($HOME/.local/bin/micromamba shell hook -s bash)"
+micromamba activate visor-cu118
+export PYTHONNOUSERSITE=1
+```
+
+If you prefer a one-shot helper:
+
+```bash
+bash ./setup.sh
+```
+
+### 2. Install ViSOR
+
+```bash
 pip install -e .
 ```
 
+### 3. Optional: native tiny-cuda-nn
 
-###  Interactive Viewer
-
-Launch the viewer (after you have installed **ViSOR**, your CUDA-enabled
-PyTorch build **and** *tiny-cuda-nn*, and downloaded the demo checkpoint):
+ViSOR runs with the pure PyTorch fallback, but the native `tiny-cuda-nn` bindings are faster when your PyTorch and CUDA toolchain match:
 
 ```bash
-visor-view                            # uses the paths hard-coded in viewer.py
-# or, if you copied the checkpoint somewhere else:
-VISOR_CKPT=/path/to/your.pt visor-view
+pip install ninja cmake
+pip install --no-build-isolation \
+  "git+https://github.com/NVlabs/tiny-cuda-nn.git@v1.7#subdirectory=bindings/torch"
 ```
 
-> The window opens at **512 × 512** (optionally doubled if
-> `SCALE = 2` inside `viewer.py`).  
-> If `SHOW_3D_DEBUG = True` a right-hand pane shows nearby camera
-> positions and lets you click-jump between them.
+## Running the Project
 
----
+### Train / watch / view
 
-#### Keyboard / mouse controls
-
-| Keys / action | Effect |
-|---------------|--------|
-| **W / S**     | Move camera **forward / back** *(local Z)* |
-| **A / D**     | Strafe **left / right** *(local X)* |
-| **E**         | Move **up** *(+Y)* |
-| **Q**         | Move **down** *(-Y)* |
-| **R**         | **Reset** to initial pose |
-| *(close window)* | Quit |
-
-**Mouse**  
-*LMB + drag* (main viewport) – orbit camera  
-*Wheel* – dolly in/out (zoom)
-
----
-
-#### Debug-pane (right half)
-
-| Action | Effect |
-|--------|--------|
-| *LMB + drag* | Orbit the debug camera |
-| *Wheel*   | Zoom the debug camera |
-| *Left-click a blue dot* | Teleport the **main** camera to that frame |
-
-Blue dots = training cameras (loaded from `views.jsonl`).  
-Red dot = your current view.
-
----
-
-### Optional helper scripts
-
-| Script | Purpose | Typical command |
-|--------|---------|-----------------|
-| `visor-depth` | Batch **MiDaS** depth maps (stored as *.npy* + preview PNG) | `visor-depth --views renders/views.jsonl` |
-| `visor-bake`  | Bake **Spherical Harmonics**:<br>• `--mode preproc` gathers top-K images per pixel <br>• `--mode bake` fits SH coefficients | `visor-bake --mode preproc --topk 128`<br>`visor-bake --mode bake --shorder 7 --samples 256` |
-
-Each script safely skips files that already exist, so you can interrupt
-and resume.
-
----
-
-### Rendering your own dataset (`render_views_random.py`)
-
-```python
-# in Blender’s *Text Editor* (select your mesh, then press Run Script)
-exec(open("render_views_random.py").read(), {})
-```
-
-* Generates **NUM_IMAGES** PNGs in `renders_random/`
-* Appends a matching line to `renders_random/views.jsonl`
-* Resumable – rerun to extend the dataset
-
-Key parameters:
-
-```python
-OUT_DIR     = Path("renders_random")
-NUM_IMAGES  = 10_000        # total frames
-RHO_MIN, RHO_MAX = 2.0, 3.5 # camera radius range
-DELTA_HI_DEG = 6            # equatorial band ±6°
-DELTA_LO_DEG = 20           # high/low-angle bands start here
-```
-
-After rendering, point `visor-train` at the folder and (optionally) the
-baked **SH** to start training your own dual-billboard model:
+The simplest loop is:
 
 ```bash
-visor-train --sh_file_front renders_random/sh_billboard_L7.pt \
-            --sh_file_rear  ""                            # rear SH optional
+bash ./run_train.sh
 ```
 
+In another terminal:
 
+```bash
+bash ./watch_train.sh
+```
+
+When you want to inspect the latest checkpoint interactively:
+
+```bash
+bash ./view_latest.sh
+```
+
+These launchers write outputs into `runs/<run_name>/` and keep `runs/latest` pointed at the active run so you can train continuously and always inspect the newest checkpoint.
+
+`view_latest.sh` expects a checkpoint under `runs/latest/`, so the most common flow is train first, then open the viewer.
+
+The watcher updates:
+
+```text
+runs/latest/watch/latest.png
+```
+
+There is also a more detailed local command note at [RUN_TRAINING_WATCH_VIEW.txt](RUN_TRAINING_WATCH_VIEW.txt).
+
+### Launch the viewer directly
+
+```bash
+python -s -m visor.viewer \
+  --renders-dir ./renders \
+  --checkpoint /path/to/checkpoint.pt \
+  --sh-file-front '' \
+  --gate-temperature 3 \
+  --hard-gate-temperature 0.75 \
+  --adaptive-router-strength 1.0
+```
+
+Controls:
+
+- `W/S`: forward/back
+- `A/D`: strafe left/right
+- `Q/E`: down/up
+- mouse drag: orbit
+- wheel: dolly
+- `R`: reset
+
+## Data Layout
+
+- `renders/`: small tracked demo dataset from the original repo
+- `renders1/`: larger local dataset used during current development; if present, ViSOR prefers it automatically
+
+You can override the default dataset location with either:
+
+- `VISOR_RENDERS_DIR=/path/to/renders`
+- `--renders-dir /path/to/renders`
+
+## Current Training Direction
+
+The newest repo state is centered on:
+
+- real ray-to-plane intersections
+- front-to-back attenuation compositing
+- tri-probe rear transport on the rear sheet
+- adaptive routing driven by probe disagreement
+- a disagreement-aware sparse Gaussian slab between the sheets
+- longer scheduled scratch / continuation runs through the launcher scripts
+
+This is intentionally not a NeRF clone. The goal is to stay compact, interpretable, and fast while still improving fidelity.
+
+## Packaging and CLI
+
+Editable install exposes:
+
+- `visor-train`
+- `visor-view`
+- `visor-watch`
+- `visor-bake`
+- `visor-depth`
+
+## Notes
+
+- `runs/`, `long_runs/`, checkpoints, and experiment dumps are intentionally ignored in git.
+- The repo keeps the older SH / MiDaS tooling around for experimentation, but the current core training path does not depend on them.
+- The tracked README GIF is preserved from the original GitHub repo and kept in `docs/demo.gif`.

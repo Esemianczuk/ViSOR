@@ -1,0 +1,29 @@
+name: visor-cu118
+channels:
+  - nvidia
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.1.2
+  - torchvision=0.16.2
+  - pytorch-cuda=11.8
+  - cuda-nvcc=11.8
+  - numpy=1.26
+  - scipy=1.11
+  - matplotlib
+  - imageio
+  - tqdm
+  - opencv
+  - pygame
+  - ninja
+  - cmake
+  - git
+  - pip
+  - setuptools<81
+
+# Notes:
+# - Run commands from this env with PYTHONNOUSERSITE=1 on machines where
+#   ~/.local site-packages may shadow env packages.
+# - Native tiny-cuda-nn is installed separately after env creation because
+#   the torch bindings may need a local source build to match the env toolchain.

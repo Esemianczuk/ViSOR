@@ -18,32 +18,8 @@ Debug pane controls (right half):
 Author: Eric Semianczuk
 """
 
+import argparse
 import json, math, os, warnings
-
-try:
-    from tinycudann import hashgrid
-except ImportError:
-    import types, tinycudann as tcnn, torch.nn as nn
-    class _HashGrid(nn.Module):
-        def __init__(self,
-                     n_levels, n_features_per_level,
-                     log2_hashmap_size, base_resolution,
-                     per_level_scale):
-            super().__init__()
-            self.enc = tcnn.Encoding(
-                n_input_dims=2,
-                encoding_config=dict(
-                    otype="HashGrid",
-                    n_levels=n_levels,
-                    n_features_per_level=n_features_per_level,
-                    log2_hashmap_size=log2_hashmap_size,
-                    base_resolution=base_resolution,
-                    per_level_scale=per_level_scale,
-                )
-            )
-        def forward(self, uv):
-            return self.enc(uv)
-    hashgrid = types.SimpleNamespace(HashGrid=_HashGrid)
 
 import numpy as np
 from pathlib import Path
@@ -54,15 +30,24 @@ import torch.nn.functional as F
 import math
 from math import factorial, pi
 from visor import PROJECT_ROOT, RENDERS_DIR
+from visor.gaussian_slab import GaussianSlab, slab_ray_context
+from visor.hashgrid import hashgrid
+from visor.plane_geometry import composite_two_planes, look_at_rotation, plane_frame, project_rays_to_plane
 
 # ────────── USER KNOBS ──────────
 RES            = 512
 CKPT_PATH      = PROJECT_ROOT / "dual_billboard_0512_x2_cont_F7_sh.pt"
 SH_FILE_FRONT  = PROJECT_ROOT / "sh_billboard_L7.pt"
-SH_FILE_REAR   = ""
+SH_FILE_REAR   = None
 K_NEIGH        = 15
 PE_BANDS       = 8
 FOV_DEG        = 60.0
+MAX_SAMPLE_OFFSET_PX = 8.0
+MAX_RELATIVE_OFFSET_PX = 2.0
+BASE_MIN_PAIR_SEPARATION_PX = 0.12
+MAX_FAN_SHIFT_PX = 1.0
+RESIDUAL_RGB_SCALE = 0.35
+HARD_GATE_TEMPERATURE = 0.75
 
 ORIENT_SMOOTH  = 1.0
 FLY_SPEED      = 1.0
@@ -71,11 +56,46 @@ SHOW_3D_DEBUG  = True
 SHOW_DEBUG_LOGS= False
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
 
 # ────────── UTILS ──────────
 def safe_px(t: torch.Tensor, res: int = RES) -> torch.LongTensor:
     """Round, clamp and cast to LONG for safe indexing."""
     return t.round().clamp_(0, res - 1).long()
+
+
+def enforce_min_pair_separation(relative_px: torch.Tensor, min_sep_px, iters: int = 2) -> torch.Tensor:
+    rel = relative_px
+    if torch.is_tensor(min_sep_px):
+        min_sep = min_sep_px.to(device=rel.device, dtype=rel.dtype).view(-1, 1)
+    else:
+        min_sep = torch.full((rel.size(0), 1), float(min_sep_px), device=rel.device, dtype=rel.dtype)
+    min_sep = min_sep.clamp_min(0.0)
+    canonical = rel.new_tensor([
+        [1.0, 0.0],
+        [-0.5, 0.8660254],
+        [-0.5, -0.8660254],
+    ])
+    pair_fallbacks = {
+        (0, 1): canonical[0] - canonical[1],
+        (0, 2): canonical[0] - canonical[2],
+        (1, 2): canonical[1] - canonical[2],
+    }
+    for _ in range(iters):
+        for i, j in ((0, 1), (0, 2), (1, 2)):
+            diff = rel[:, i] - rel[:, j]
+            dist = diff.norm(dim=-1, keepdim=True)
+            fallback = pair_fallbacks[(i, j)].unsqueeze(0).expand_as(diff)
+            fallback = fallback / fallback.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            dir_ij = torch.where(dist > 1e-4, diff / dist.clamp_min(1e-4), fallback)
+            push = (min_sep - dist).clamp_min(0.0) * 0.5
+            rel = rel.clone()
+            rel[:, i] = rel[:, i] + push * dir_ij
+            rel[:, j] = rel[:, j] - push * dir_ij
+        rel = rel - rel.mean(dim=1, keepdim=True)
+    return rel
 
 def load_views(renders_dir: Path, fname: str = "views.jsonl") -> tuple[np.ndarray, ...]:
     json_path = renders_dir / fname
@@ -98,13 +118,33 @@ def load_views(renders_dir: Path, fname: str = "views.jsonl") -> tuple[np.ndarra
     pos = np.asarray(pos, dtype=np.float32)
     return pos, np.asarray(phi), np.asarray(theta), np.asarray(rho)
 
-POS_ALL, PHI_ALL, THETA_ALL, RHO_ALL = load_views(RENDERS_DIR)
-N_CAM = POS_ALL.shape[0]
+POS_ALL = np.empty((0, 3), dtype=np.float32)
+PHI_ALL = np.empty((0,), dtype=np.float32)
+THETA_ALL = np.empty((0,), dtype=np.float32)
+RHO_ALL = np.empty((0,), dtype=np.float32)
+N_CAM = 0
 
 def nearest_k(p, k=K_NEIGH):
+    if POS_ALL.shape[0] == 0:
+        raise RuntimeError("No camera views have been loaded.")
+    k = max(1, min(k, POS_ALL.shape[0]))
     d2 = np.sum((POS_ALL - p)**2, 1)
-    idx = np.argpartition(d2, k)[:k]
+    if k == POS_ALL.shape[0]:
+        idx = np.arange(POS_ALL.shape[0])
+    else:
+        idx = np.argpartition(d2, k - 1)[:k]
     return idx, np.sqrt(d2[idx])
+
+
+def quantize_render_res(scale: float) -> int:
+    scale = float(min(max(scale, 1.0 / RES), 1.0))
+    return max(32, min(RES, int(round(RES * scale))))
+
+
+def build_render_grid(out_res: int, device=DEVICE, dtype=torch.float16):
+    coords = torch.linspace(0, RES - 1, out_res, device=device, dtype=dtype)
+    yy, xx = torch.meshgrid(coords, coords, indexing="ij")
+    return yy.flatten(), xx.flatten()
 
 def bound_cluster(idx):
     sub = POS_ALL[idx]
@@ -161,13 +201,12 @@ class CameraEmbed(nn.Module):
         )
 
     def forward(self, φ, θ, ρ):
-        # keep it in float32
-        φf = φ.float()
-        θf = θ.float()
-        ρf = ρ.float()
-        inp = torch.stack([φf, θf, ρf], -1).unsqueeze(0)  # shape [1,3]
-        out = self.net(inp)  # shape [1, 32]
-        return out[0]        # shape [32]
+        inp = torch.stack([φ.float(), θ.float(), ρ.float()], -1)
+        squeeze = inp.dim() == 1
+        if squeeze:
+            inp = inp.unsqueeze(0)
+        out = self.net(inp)
+        return out[0] if squeeze else out
 
 
 # ───── positional encodings ─────
@@ -416,18 +455,23 @@ class SheetBase(nn.Module):
         """
         y, x, cam_feat can come in float16 or float32. We'll unify them to half.
         """
-        yL = safe_px(y).to(device=DEVICE)
-        xL = safe_px(x).to(device=DEVICE)
-
-        # convert to half AFTER safe_px
-        uv = torch.stack([xL, yL], dim=-1).float() / RES  # uv is float
+        uv = torch.stack([
+            x.float().clamp(0, RES - 1) / max(RES - 1, 1),
+            y.float().clamp(0, RES - 1) / max(RES - 1, 1),
+        ], dim=-1).to(device=DEVICE)
         uv = uv.half()
 
         codes_xy = self.codes(uv)  # returns half, shape [B, code_dim]
 
-        cam_feat_ = cam_feat.to(dtype=torch.half)  # ensure half
-        # expand shape
-        cam_exp = cam_feat_.unsqueeze(0).expand_as(codes_xy)
+        cam_feat_ = cam_feat.to(dtype=torch.half)
+        if cam_feat_.dim() == 1:
+            cam_exp = cam_feat_.unsqueeze(0).expand_as(codes_xy)
+        elif cam_feat_.dim() == 2 and cam_feat_.shape[0] == codes_xy.shape[0]:
+            cam_exp = cam_feat_
+        elif cam_feat_.dim() == 2 and cam_feat_.shape[0] == 1:
+            cam_exp = cam_feat_.expand_as(codes_xy)
+        else:
+            raise ValueError(f"Unsupported cam_feat shape for _feat: {tuple(cam_feat_.shape)}")
         feat_input = torch.cat([codes_xy, cam_exp], dim=-1)  # half
         return self.pos(feat_input)  # returns half
 
@@ -468,92 +512,171 @@ class RefractionSheet(SheetBase):
         super().__init__(h,w)
         self.with_sh = with_sh
         self.sh_embed = None
-        self.delta_mlp = nn.Sequential(
-            make_mlp(POS_OUT, 256, 9, depth=4),
+        router_dim = POS_OUT + PE_DIM + 4
+        self.layout_mlp = nn.Sequential(
+            make_mlp(router_dim, 256, 4, depth=4),
             nn.Tanh()
         )
-        in_spec = POS_OUT + PE_DIM + (3 if with_sh else 0)
-        self.cR = make_mlp(in_spec, HEAD_HID, 3, siren=True)
-        self.cG = make_mlp(in_spec, HEAD_HID, 3, siren=True)
-        self.cB = make_mlp(in_spec, HEAD_HID, 3, siren=True)
-        self.mix= nn.Conv1d(3,3,1,bias=False)
-        nn.init.eye_(self.mix.weight.squeeze(-1))
+        self.gate_mlp = make_mlp(router_dim, 256, 3, depth=3)
+        self.route_strength_mlp = nn.Sequential(
+            make_mlp(router_dim, 256, 1, depth=2),
+            nn.Sigmoid()
+        )
+        route_last = self.route_strength_mlp[0][-1]
+        nn.init.zeros_(route_last.weight)
+        nn.init.constant_(route_last.bias, 4.0)
+        base_in_spec = POS_OUT + PE_DIM + 2 + (3 if with_sh else 0)
+        resid_in_spec = POS_OUT * 2 + PE_DIM + 2 + 4 + (3 if with_sh else 0)
+        self.component_heads = nn.ModuleList([
+            make_mlp(base_in_spec, HEAD_HID, 3, siren=True),
+            make_mlp(resid_in_spec, HEAD_HID, 3, siren=True),
+            make_mlp(resid_in_spec, HEAD_HID, 3, siren=True),
+        ])
 
         self.alpha_mlp = nn.Sequential(
-            make_mlp(POS_OUT + PE_DIM, 256, 1, depth=2),
+            make_mlp(router_dim + 3, 256, 1, depth=2),
             nn.Sigmoid()
         )
 
-    def forward(self, y, x, ray_o, ray_d, cam_feat):
-        """
-        y, x => indexing
-        ray_o, ray_d => half or float => we unify to half or float as needed
-        cam_feat => we unify to half
-        """
-        base_feat = self._feat(y, x, cam_feat)  # [B,POS_OUT] half
-
-        delta_raw = self.delta_mlp(base_feat)  # half
-        delta_raw = delta_raw.clamp(-1,1)
-        # reshape => (B, 3, 3)
-        B = y.size(0)
-        delta = delta_raw.view(B, 3, 3)
-        # unify ray_d => half
-        ray_d_ = ray_d.to(dtype=torch.half)
-        # add delta
-        dirs = ray_d_.unsqueeze(1) + delta * math.radians(2.0)
-        dirs = F.normalize(dirs, dim=-1)  # shape [B,3,3]
-
-        # Flatten => shape [B*3, 3]
-        dirs_all = dirs.reshape(-1,3)
-
-        # optional SH
-        sh_col_all = None
-        if self.with_sh and self.sh_embed is not None:
-            yL = safe_px(y)
-            xL = safe_px(x)
-            # cast dirs_all to float32 for SH
-            dirs_all32 = dirs_all.float()
-            raw_col_all = self.sh_embed.forward_all(yL, xL, dirs_all32)  # float32 => [B*3,3]
-            sh_col_all  = raw_col_all.half()
-
-        # expand base_feat => shape [B, 3, POS_OUT], then flatten => [B*3, POS_OUT]
-        base_feat_all = base_feat.unsqueeze(1).expand(B,3, base_feat.size(-1)).reshape(-1, base_feat.size(-1))  # half
-
-        # build direction + position encoding (pe_dir, pe_loc)
-        pe_dir_all = encode_dir(dirs_all)  # float
-        pe_dir_all = pe_dir_all.half()
-
-        ray_o_ = ray_o.to(dtype=torch.half)
-        pe_loc_o = encode_vec(ray_o_).unsqueeze(1)  # shape [B,1,pe_dim]
-        pe_loc_o = pe_loc_o.expand(B,3, pe_loc_o.size(-1)).reshape(B*3, -1)  # half
-
-        if self.with_sh and sh_col_all is not None:
-            feat_all = torch.cat([base_feat_all, pe_dir_all, pe_loc_o, sh_col_all], dim=-1)
+    def forward(self, y, x, plane_hit, ray_d, cam_feat, front_alpha=None, front_rgb=None, offset_scale=1.0, gate_temperature=1.0, hard_gate_temperature=HARD_GATE_TEMPERATURE, adaptive_router_strength=1.0, return_aux=False):
+        base_feat = self._feat(y, x, cam_feat)
+        if front_alpha is None:
+            front_alpha = torch.zeros_like(y, dtype=base_feat.dtype)
         else:
-            feat_all = torch.cat([base_feat_all, pe_dir_all, pe_loc_o], dim=-1)
+            front_alpha = front_alpha.to(dtype=base_feat.dtype)
+        if front_rgb is None:
+            front_rgb = torch.zeros((y.shape[0], 3), device=base_feat.device, dtype=base_feat.dtype)
+        else:
+            front_rgb = front_rgb.to(dtype=base_feat.dtype)
 
-        # chunk into 3
-        in_cR = feat_all[0::3]
-        in_cG = feat_all[1::3]
-        in_cB = feat_all[2::3]
+        ray_d_ = ray_d.to(dtype=base_feat.dtype)
+        plane_hit_ = plane_hit.to(dtype=base_feat.dtype)
+        view_pe = torch.cat([encode_dir(ray_d_).half(), encode_vec(plane_hit_).half()], dim=-1)
+        router_in = torch.cat([base_feat, view_pe, front_alpha.unsqueeze(-1), front_rgb], dim=-1)
 
-        cR = torch.sigmoid(self.cR(in_cR))
-        cG = torch.sigmoid(self.cG(in_cG))
-        cB = torch.sigmoid(self.cB(in_cB))
-        # shape => [B, 3, 3]
-        col = torch.stack([cR,cG,cB], dim=1)
-        col = self.mix(col)  # => [B, 3, 3]
+        layout_raw = self.layout_mlp(router_in).clamp(-1, 1)
+        if offset_scale <= 0.0:
+            relative_px = torch.zeros((y.shape[0], 3, 2), device=base_feat.device, dtype=base_feat.dtype)
+        else:
+            axis_raw = layout_raw[:, :2]
+            axis = F.normalize(axis_raw + 1e-6, dim=-1)
+            perp = torch.stack([-axis[:, 1], axis[:, 0]], dim=-1)
+            min_span = BASE_MIN_PAIR_SEPARATION_PX * offset_scale
+            span_px = min_span + 0.5 * (layout_raw[:, 2] + 1.0) * (MAX_RELATIVE_OFFSET_PX * offset_scale - min_span)
+            fan_px = layout_raw[:, 3] * (MAX_FAN_SHIFT_PX * offset_scale)
+            center = torch.zeros((y.shape[0], 2), device=base_feat.device, dtype=base_feat.dtype)
+            pos = axis * span_px.unsqueeze(-1) + perp * fan_px.unsqueeze(-1)
+            neg = -axis * span_px.unsqueeze(-1) + perp * fan_px.unsqueeze(-1)
+            relative_px = torch.stack([center, pos, neg], dim=1)
+        offset_px = relative_px
+        offset_raw = layout_raw
+        sample_x = x.unsqueeze(1).float() + offset_px[..., 0]
+        sample_y = y.unsqueeze(1).float() + offset_px[..., 1]
+        sample_count = sample_x.shape[0] * sample_x.shape[1]
+        sample_valid = (
+            (sample_x >= 0.0) & (sample_x <= (RES - 1)) &
+            (sample_y >= 0.0) & (sample_y <= (RES - 1))
+        )
 
-        idx3 = torch.arange(3, device=dirs.device)
-        rgbR = col[:, idx3, idx3]  # shape [B, 3], half
+        gate_logits = self.gate_mlp(router_in)
+        route_strength_raw = self.route_strength_mlp(router_in).squeeze(-1)
+        adaptive_mix = min(max(float(adaptive_router_strength), 0.0), 1.0)
+        gate_temp_easy = max(float(gate_temperature), 1e-4)
+        gate_temp_hard = min(gate_temp_easy, max(float(hard_gate_temperature), 1e-4))
+        if adaptive_mix <= 0.0:
+            route_strength = torch.ones_like(route_strength_raw)
+            gate_temp_ray = torch.full_like(route_strength_raw, gate_temp_easy)
+        else:
+            route_strength = torch.lerp(
+                torch.ones_like(route_strength_raw),
+                route_strength_raw,
+                adaptive_mix,
+            )
+            gate_temp_pred = gate_temp_easy + (gate_temp_hard - gate_temp_easy) * route_strength_raw.float()
+            gate_temp_ray = torch.lerp(
+                torch.full_like(route_strength_raw.float(), gate_temp_easy),
+                gate_temp_pred,
+                adaptive_mix,
+            ).to(dtype=route_strength_raw.dtype)
+        soft_gates = F.softmax(gate_logits.float() / gate_temp_ray.float().unsqueeze(-1), dim=-1)
+        if adaptive_mix > 0.0:
+            uniform_gates = torch.full_like(soft_gates, 1.0 / 3.0)
+            gates = torch.lerp(uniform_gates, soft_gates, route_strength.float().unsqueeze(-1)).to(dtype=base_feat.dtype)
+        else:
+            gates = soft_gates.to(dtype=base_feat.dtype)
 
-        # alpha from direction 0 only
-        pe_dir_0 = pe_dir_all[0::3]
-        # base_feat => [B,POS_OUT], so cat => shape [B, (POS_OUT+pe_dim)]
-        alpha_in = torch.cat([base_feat, pe_dir_0, encode_vec(ray_o_).half()], dim=-1)
+        cam_feat_samples = cam_feat.unsqueeze(0).expand(sample_count, -1)
+        sample_feat = self._feat(
+            sample_y.reshape(-1),
+            sample_x.reshape(-1),
+            cam_feat_samples,
+        ).view(sample_y.shape[0], sample_y.shape[1], -1)
+        center_feat = sample_feat[:, 0]
+        zero_offset = torch.zeros_like(relative_px[:, 0])
+        base_in = torch.cat([center_feat, view_pe, zero_offset], dim=-1)
+        sample_sh = None
+        if self.with_sh and self.sh_embed is not None:
+            ray_dir_samples = ray_d.unsqueeze(1).expand(-1, sample_y.shape[1], -1).reshape(-1, ray_d.shape[-1])
+            sample_sh = self.sh_embed(
+                safe_px(sample_y.reshape(-1)),
+                safe_px(sample_x.reshape(-1)),
+                ray_dir_samples.float(),
+            ).view(sample_y.shape[0], sample_y.shape[1], -1)
+            sh_center = sample_sh[:, 0].half()
+            base_in = torch.cat([base_in, sh_center], dim=-1)
+        base_rgb = torch.sigmoid(self.component_heads[0](base_in))
+
+        flank_components = []
+        residual_rgb = []
+        for k, head in ((1, self.component_heads[1]), (2, self.component_heads[2])):
+            feat_k = sample_feat[:, k]
+            feat_delta = feat_k - center_feat
+            resid_in = torch.cat([
+                center_feat,
+                feat_delta,
+                view_pe,
+                (relative_px[:, k] / max(MAX_RELATIVE_OFFSET_PX, 1e-6)).to(dtype=feat_k.dtype),
+                front_alpha.unsqueeze(-1),
+                front_rgb,
+            ], dim=-1)
+            if sample_sh is not None:
+                sh_c = sample_sh[:, k].half()
+                resid_in = torch.cat([resid_in, sh_c], dim=-1)
+            resid_strength = (
+                relative_px[:, k].norm(dim=-1, keepdim=True)
+                / max(MAX_RELATIVE_OFFSET_PX, 1e-6)
+            ).to(dtype=feat_k.dtype)
+            resid_strength = resid_strength * sample_valid[:, k].to(dtype=feat_k.dtype).unsqueeze(-1)
+            resid_delta = torch.tanh(head(resid_in)) * (RESIDUAL_RGB_SCALE * resid_strength)
+            residual_rgb.append(resid_delta)
+            flank_components.append((base_rgb + resid_delta).clamp(0.0, 1.0))
+
+        head_rgb = torch.stack([base_rgb, flank_components[0], flank_components[1]], dim=1)
+        transport_rgb = (gates.unsqueeze(-1) * head_rgb).sum(dim=1)
+        alpha_in = torch.cat([router_in, gates], dim=-1)
         alpha_val = self.alpha_mlp(alpha_in).squeeze(-1)
-
-        return rgbR, alpha_val, delta_raw
+        if return_aux:
+            aux = {
+                "head_rgb": head_rgb,
+                "transport_rgb": transport_rgb,
+                "gates": gates,
+                "gate_logits": gate_logits,
+                "offset_px": offset_px,
+                "relative_px": relative_px,
+                "span_px": span_px,
+                "fan_px": fan_px,
+                "base_rgb": base_rgb,
+                "residual_rgb": torch.stack(residual_rgb, dim=1),
+                "sample_x": sample_x,
+                "sample_y": sample_y,
+                "sample_valid": sample_valid,
+                "soft_gates": soft_gates,
+                "route_strength": route_strength,
+                "route_strength_raw": route_strength_raw,
+                "gate_temperature_ray": gate_temp_ray,
+            }
+            return transport_rgb, alpha_val, offset_raw, aux
+        return transport_rgb, alpha_val, offset_raw
 
 
 # ────────── RAY UTILS ──────────
@@ -626,20 +749,89 @@ def project_3D_to_2D(pts_3d, cam_pos, cam_yaw, cam_pitch, cam_dist, scr_w, scr_h
 
 # ────────── MAIN ──────────
 def main():
+    global POS_ALL, PHI_ALL, THETA_ALL, RHO_ALL, N_CAM
+    global CKPT_PATH, SH_FILE_FRONT, SH_FILE_REAR, K_NEIGH, SCALE, SHOW_3D_DEBUG
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--renders-dir", type=Path, default=RENDERS_DIR,
+                        help="Directory containing views.jsonl plus RGB/depth frames.")
+    parser.add_argument("--checkpoint", type=Path, default=CKPT_PATH,
+                        help="Checkpoint file to load.")
+    parser.add_argument("--sh-file-front", type=Path, default=SH_FILE_FRONT,
+                        help="Optional baked SH file for the front billboard.")
+    parser.add_argument("--sh-file-rear", type=Path, default=None,
+                        help="Optional baked SH file for the rear billboard.")
+    parser.add_argument("--k-neigh", type=int, default=K_NEIGH,
+                        help="How many nearby cameras to blend for pose interpolation.")
+    parser.add_argument("--scale", type=int, default=SCALE,
+                        help="Window upscaling factor.")
+    parser.add_argument("--no-debug", action="store_true",
+                        help="Hide the right-side debug viewport.")
+    parser.add_argument("--headless", action="store_true",
+                        help="Use SDL dummy mode for non-interactive smoke tests.")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Render this many frames and exit. 0 means interactive until closed.")
+    parser.add_argument("--save-frame", type=Path, default=None,
+                        help="Optional PNG path for the final on-screen frame.")
+    parser.add_argument("--gate-temperature", type=float, default=1.0,
+                        help="Rear transport gate temperature. Values above 1 soften routing across the three probes.")
+    parser.add_argument("--hard-gate-temperature", type=float, default=HARD_GATE_TEMPERATURE,
+                        help="Minimum per-ray gate temperature on hard rays when adaptive routing is active.")
+    parser.add_argument("--adaptive-router-strength", type=float, default=1.0,
+                        help="Blend from legacy learned routing (0) to adaptive easy-vs-hard routing (1).")
+    parser.add_argument("--move-render-scale", type=float, default=0.5,
+                        help="Internal render scale while the main camera is moving. 1 keeps full resolution at all times.")
+    parser.add_argument("--idle-fullres-frames", type=int, default=6,
+                        help="How many still frames to wait before snapping back to full internal resolution.")
+    parser.add_argument("--force-render-scale", type=float, default=0.0,
+                        help="Override internal render scale for every frame. 0 keeps adaptive movement scaling.")
+    args = parser.parse_args()
+
+    if args.headless:
+        os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
+    CKPT_PATH = args.checkpoint.expanduser()
+    SH_FILE_FRONT = args.sh_file_front.expanduser() if args.sh_file_front else None
+    SH_FILE_REAR = args.sh_file_rear.expanduser() if args.sh_file_rear else None
+    K_NEIGH = max(1, args.k_neigh)
+    SCALE = max(1, args.scale)
+    SHOW_3D_DEBUG = not args.no_debug
+
+    renders_dir = args.renders_dir.expanduser()
+    POS_ALL, PHI_ALL, THETA_ALL, RHO_ALL = load_views(renders_dir)
+    N_CAM = POS_ALL.shape[0]
+    if N_CAM == 0:
+        raise SystemExit(f"❌ no camera records found in {renders_dir}")
+
+    print(f"Using renders dir: {renders_dir}")
+    print(
+        f"Viewer config: checkpoint={CKPT_PATH}, k_neigh={K_NEIGH}, debug={SHOW_3D_DEBUG}, "
+        f"gate_temperature={args.gate_temperature:.2f}, hard_gate_temperature={args.hard_gate_temperature:.2f}, "
+        f"adaptive_router_strength={args.adaptive_router_strength:.2f}, "
+        f"move_render_scale={args.move_render_scale:.2f}, idle_fullres_frames={max(0, args.idle_fullres_frames)}, "
+        f"force_render_scale={args.force_render_scale:.2f}"
+    )
+
     centre_idx = N_CAM // 2
     cam_pos_np = POS_ALL[centre_idx].copy()
 
     neigh_idx,_ = nearest_k(cam_pos_np, K_NEIGH)
     box_lo, box_hi = bound_cluster(neigh_idx)
 
+    front_has_sh = SH_FILE_FRONT is not None and Path(SH_FILE_FRONT).is_file()
+    rear_has_sh = SH_FILE_REAR is not None and Path(SH_FILE_REAR).is_file()
+
     # load models
     ck = torch.load(CKPT_PATH, map_location="cpu")
-    front = OcclusionSheet(RES, RES, bool(SH_FILE_FRONT)).to(DEVICE)
-    rear  = RefractionSheet(RES, RES, bool(SH_FILE_REAR)).to(DEVICE)
+    slab_splats = int(ck["slab"]["mean_raw"].shape[0]) if ("slab" in ck and "mean_raw" in ck["slab"]) else 32
+    front = OcclusionSheet(RES, RES, front_has_sh).to(DEVICE)
+    rear  = RefractionSheet(RES, RES, rear_has_sh).to(DEVICE)
+    slab = GaussianSlab(num_splats=slab_splats).to(DEVICE)
     cam_mlp = CameraEmbed().to(DEVICE)  # float32
 
     front.load_state_dict(ck["front"], strict=False)
     rear.load_state_dict(ck["rear"], strict=False)
+    if "slab" in ck:
+        slab.load_state_dict(ck["slab"], strict=False)
     if "camera_embed" in ck:
         cam_mlp.load_state_dict(ck["camera_embed"], strict=False)
 
@@ -652,12 +844,18 @@ def main():
 
     front.eval()
     rear.eval()
+    slab.eval()
     cam_mlp.eval()
 
-    if SH_FILE_FRONT and os.path.isfile(SH_FILE_FRONT):
-        front.sh_embed = SHEmbed(SH_FILE_FRONT)
-    if SH_FILE_REAR and os.path.isfile(SH_FILE_REAR):
-        rear.sh_embed = SHEmbed(SH_FILE_REAR)
+    phi_all_t = torch.from_numpy(PHI_ALL).to(DEVICE, dtype=torch.float32)
+    theta_all_t = torch.from_numpy(THETA_ALL).to(DEVICE, dtype=torch.float32)
+    rho_all_t = torch.from_numpy(RHO_ALL).to(DEVICE, dtype=torch.float32)
+    all_cam_feats = cam_mlp(phi_all_t, theta_all_t, rho_all_t)
+
+    if front_has_sh:
+        front.sh_embed = SHEmbed(str(SH_FILE_FRONT))
+    if rear_has_sh:
+        rear.sh_embed = SHEmbed(str(SH_FILE_REAR))
 
     # init orientation
     yaw0, pitch0 = yaw_pitch_from_phi_theta(PHI_ALL[centre_idx], THETA_ALL[centre_idx])
@@ -681,23 +879,31 @@ def main():
     debug_dragActive = False
     last_mouseDbg = (0,0)
     projected_points_2d = []
+    cached_main_surface = None
+    cached_debug_surface = None
+    last_debug_signature = None
 
-    # meshgrid in half
-    yy, xx = torch.meshgrid(
-        torch.arange(RES, device=DEVICE, dtype=torch.float16),
-        torch.arange(RES, device=DEVICE, dtype=torch.float16),
-        indexing="ij"
-    )
-    yyf, xxf = yy.flatten(), xx.flatten()
+    render_grid_cache = {}
+
+    def get_render_grid(render_res: int):
+        cached = render_grid_cache.get(render_res)
+        if cached is None:
+            cached = build_render_grid(render_res, device=DEVICE, dtype=torch.float16)
+            render_grid_cache[render_res] = cached
+        return cached
 
     last_idxs = None
     last_yaw, last_pitch = yaw, pitch
+    last_render_res = None
+    frames_since_motion = max(0, args.idle_fullres_frames)
 
     running = True
+    frame_idx = 0
 
     with torch.inference_mode():
         while running:
             dt = clock.tick(60)/1000.0
+            debug_changed = False
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
                     running = False
@@ -705,6 +911,7 @@ def main():
                     if e.key == pygame.K_r:
                         cam_pos_np[:] = POS_ALL[centre_idx]
                         yaw, pitch = yaw0, pitch0
+                        debug_changed = True
 
                 if e.type == pygame.MOUSEBUTTONDOWN:
                     if e.button == 1:
@@ -725,6 +932,7 @@ def main():
                                     if dist_sq <= radius_sq:
                                         cam_pos_np[:] = POS_ALL[i_cam]
                                         clicked_any = True
+                                        debug_changed = True
                                         break
                                 if not clicked_any:
                                     debug_dragActive = True
@@ -739,35 +947,52 @@ def main():
                         if debugSurfaceRect.collidepoint(mx,my):
                             step= (0.5 if e.y>0 else -0.5)
                             debug_dist = max(debug_dist + step, 0.1)
+                            debug_changed = True
 
             keys = pygame.key.get_pressed()
             move_speed = FLY_SPEED * dt
-            # orientation from yaw/pitch
-            Rwc_f32 = rot_yx(yaw, pitch)  # float32
+            Rwc_f32 = look_at_rotation(
+                torch.tensor(cam_pos_np, device=DEVICE, dtype=torch.float32),
+                device=DEVICE,
+            )
             right_vec = Rwc_f32[0,:].cpu().numpy()
             up_vec    = Rwc_f32[1,:].cpu().numpy()
             fwd_vec   = Rwc_f32[2,:].cpu().numpy()
 
             move = np.array([0,0,0], dtype=np.float32)
-            if keys[pygame.K_a]:
-                move += fwd_vec
-            if keys[pygame.K_d]:
-                move -= fwd_vec
             if keys[pygame.K_w]:
-                move -= right_vec
+                move += fwd_vec
             if keys[pygame.K_s]:
+                move -= fwd_vec
+            if keys[pygame.K_a]:
+                move -= right_vec
+            if keys[pygame.K_d]:
                 move += right_vec
             if keys[pygame.K_e]:
                 move += up_vec
             if keys[pygame.K_q]:
                 move -= up_vec
 
+            cam_pos_prev = cam_pos_np.copy()
             cam_pos_np += move * move_speed
 
             idxs, dists = nearest_k(cam_pos_np, K_NEIGH)
             box_lo_, box_hi_ = bound_cluster(idxs)
             box_lo, box_hi   = box_lo_, box_hi_
             cam_pos_np = np.minimum(np.maximum(cam_pos_np, box_lo), box_hi)
+            cam_pos_changed = not np.allclose(cam_pos_np, cam_pos_prev, atol=1e-6)
+            if cam_pos_changed:
+                frames_since_motion = 0
+            else:
+                frames_since_motion += 1
+            if args.force_render_scale > 0.0:
+                render_scale = args.force_render_scale
+            elif frames_since_motion < max(0, args.idle_fullres_frames):
+                render_scale = args.move_render_scale
+            else:
+                render_scale = 1.0
+            render_res = quantize_render_res(render_scale)
+            main_changed = cached_main_surface is None or cam_pos_changed or render_res != last_render_res
 
             if debug_dragActive and SHOW_3D_DEBUG:
                 mx, my = pygame.mouse.get_pos()
@@ -776,27 +1001,13 @@ def main():
                 debug_yaw   += dx * 0.01
                 debug_pitch += -dy * 0.01
                 debug_pitch = np.clip(debug_pitch, -math.pi*0.49, math.pi*0.49)
+                debug_changed = True
 
             weights = 1/(dists+1e-8)
             weights /= weights.sum()
-
-            phi_neighbors   = PHI_ALL[idxs]
-            theta_neighbors = THETA_ALL[idxs]
-            rho_neighbors   = RHO_ALL[idxs]
-
-            # build neighbor_embeds in float32
-            phi_t   = torch.tensor(phi_neighbors, device=DEVICE, dtype=torch.float32)
-            theta_t = torch.tensor(theta_neighbors, device=DEVICE, dtype=torch.float32)
-            rho_t   = torch.tensor(rho_neighbors, device=DEVICE, dtype=torch.float32)
-
-            neighbor_embeds = []
-            for iN in range(K_NEIGH):
-                neighbor_embeds.append(cam_mlp(phi_t[iN], theta_t[iN], rho_t[iN]))  # [32], float32
-
-            neighbor_embeds = torch.stack(neighbor_embeds, dim=0)  # shape [K_NEIGH,32], float32
-
-            w_t = torch.tensor(weights, device=DEVICE, dtype=torch.float32).unsqueeze(1)  # [K_NEIGH,1]
-            cam_feat_interpolated = (neighbor_embeds * w_t).sum(dim=0)  # [32], float32
+            idxs_t = torch.as_tensor(idxs, device=DEVICE, dtype=torch.long)
+            w_t = torch.as_tensor(weights, device=DEVICE, dtype=torch.float32).unsqueeze(1)
+            cam_feat_interpolated = (all_cam_feats.index_select(0, idxs_t) * w_t).sum(dim=0)
 
             # orientation
             nearest = idxs[np.argmin(dists)]
@@ -817,72 +1028,120 @@ def main():
             if SHOW_DEBUG_LOGS and something_changed:
                 print(f"Nearest cluster changed. yaw={yaw:.3f} pitch={pitch:.3f}")
 
-            # convert camera pos to float16 only for the rendering pass
-            cam_pos_16 = torch.tensor(cam_pos_np, device=DEVICE, dtype=torch.float16)
-            # orientation matrix in half
-            Rwc_half = Rwc_f32.half()
+            if main_changed:
+                yyf, xxf = get_render_grid(render_res)
+                cam_pos_16 = torch.tensor(cam_pos_np, device=DEVICE, dtype=torch.float16)
+                Rwc_half = Rwc_f32.half()
 
-            # billboard pass
-            oF, dF = pixel_rays(yyf, xxf, Rwc_half, cam_pos_16, z=0.0)
-            # store directions for SH
-            if front.with_sh and front.sh_embed is not None:
-                front._dir_cache = dF  # shape [B,3], half
+                ray_o, ray_d = pixel_rays(yyf, xxf, Rwc_half, cam_pos_16, z=0.0)
+                front_center, rear_center, plane_normal, plane_u, plane_v = plane_frame(
+                    cam_pos_16, z_off, device=DEVICE, dtype=ray_o.dtype
+                )
+                xF, yF, hitF, tF, validF = project_rays_to_plane(
+                    ray_o, ray_d, front_center, plane_normal, plane_u, plane_v, RES
+                )
+                xR, yR, hitR, tR, validR = project_rays_to_plane(
+                    ray_o, ray_d, rear_center, plane_normal, plane_u, plane_v, RES
+                )
 
-            # build the positional encodes in half
-            pe_dirF = encode_dir(dF)     # float => cast to half
-            pe_dirF = pe_dirF.half()
-            # expand cam_pos for each pixel
-            cpos_exp = cam_pos_16.unsqueeze(0).expand_as(dF)
-            pe_posF  = encode_vec(cpos_exp)  # float => cast
-            pe_posF  = pe_posF.half()
+                if front.with_sh and front.sh_embed is not None:
+                    front._dir_cache = ray_d
 
-            peF = torch.cat([pe_dirF, pe_posF], dim=-1)  # half
-            # forward
-            rgbF, tauF = front(yyf, xxf, peF, cam_feat_interpolated)  # half
-            rgbF = rgbF.clamp(0,1)
-            tauF = tauF.clamp(0,1)
+                pe_dirF = encode_dir(ray_d).half()
+                pe_posF = encode_vec(hitF).half()
+                peF = torch.cat([pe_dirF, pe_posF], dim=-1)
+                rgbF, tauF = front(yF, xF, peF, cam_feat_interpolated)
+                rgbF = rgbF.clamp(0,1) * validF.unsqueeze(-1).to(dtype=rgbF.dtype)
+                tauF = torch.where(validF, tauF.clamp(0,1), torch.ones_like(tauF))
+                alphaF = 1.0 - tauF
 
-            # refraction
-            oR, dR = pixel_rays(yyf, xxf, Rwc_half, cam_pos_16, z_off)
-            rgbR, alphaR, _ = rear(yyf, xxf, oR, dR, cam_feat_interpolated)
-            rgbR   = rgbR.clamp(0,1)
-            alphaR = alphaR.clamp(0,1)
+                rgbR, alphaR, _, rear_aux = rear(
+                    yR, xR, hitR, ray_d, cam_feat_interpolated,
+                    front_alpha=alphaF.detach(),
+                    front_rgb=rgbF.detach(),
+                    gate_temperature=args.gate_temperature,
+                    hard_gate_temperature=args.hard_gate_temperature,
+                    adaptive_router_strength=args.adaptive_router_strength,
+                    return_aux=True,
+                )
+                rgbR   = rgbR.clamp(0,1) * validR.unsqueeze(-1).to(dtype=rgbR.dtype)
+                alphaR = alphaR.clamp(0,1) * validR.to(dtype=alphaR.dtype)
+                slab_context = slab_ray_context(
+                    rear_aux["head_rgb"],
+                    rear_aux["gates"],
+                    rear_aux["route_strength"],
+                    alphaF,
+                    alphaR,
+                )
+                slab_trans = slab(
+                    hitF, hitR,
+                    front_center, rear_center,
+                    plane_normal, plane_u, plane_v,
+                    validF, validR,
+                    ray_context=slab_context,
+                )
+                alphaR_eff = alphaR * slab_trans.to(dtype=alphaR.dtype)
 
-            final = rgbF + (1 - tauF).unsqueeze(-1) * (alphaR.unsqueeze(-1) * rgbR)
-            # shape => [B,3], B=RES*RES => reshape => [RES,RES,3]
+                final, _, _ = composite_two_planes(
+                    rgbF, alphaF, tF, validF,
+                    rgbR, alphaR_eff, tR, validR,
+                )
+                frame_u8 = (
+                    final.view(render_res, render_res, 3)
+                    .clamp(0.0, 1.0)
+                    .mul(255.0)
+                    .to(torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
+                cached_main_surface = pygame.surfarray.make_surface(frame_u8.swapaxes(0,1))
+                if render_res != RES or SCALE != 1:
+                    cached_main_surface = pygame.transform.smoothscale(cached_main_surface, (RES*SCALE, RES*SCALE))
+                last_render_res = render_res
 
-            out_np = (final.view(RES,RES,3).float().cpu().numpy() * 255).astype(np.uint8)
-
-            mainSurf = pygame.surfarray.make_surface(out_np.swapaxes(0,1))
-            if SCALE != 1:
-                mainSurf = pygame.transform.smoothscale(mainSurf, (RES*SCALE, RES*SCALE))
-            screen.blit(mainSurf, (0,0))
+            screen.blit(cached_main_surface, (0,0))
 
             if SHOW_3D_DEBUG:
-                debugSurf= pygame.Surface((RES*SCALE, RES*SCALE))
-                debugSurf.fill((15,15,15))
+                debug_signature = (
+                    round(float(debug_yaw), 5),
+                    round(float(debug_pitch), 5),
+                    round(float(debug_dist), 5),
+                    tuple(np.round(cam_pos_np.astype(np.float32), 5)),
+                )
+                if debug_changed or main_changed or cached_debug_surface is None or debug_signature != last_debug_signature:
+                    debugSurf= pygame.Surface((RES*SCALE, RES*SCALE))
+                    debugSurf.fill((15,15,15))
 
-                pts_3d = POS_ALL.astype(np.float32)
-                proj2d = project_3D_to_2D(pts_3d, None, debug_yaw, debug_pitch, debug_dist,
-                                         scr_w=RES*SCALE, scr_h=RES*SCALE)
-                projected_points_2d = proj2d
-                for i,(sx,sy) in enumerate(proj2d):
-                    if sx is None:
-                        continue
-                    c= (100,100,255)
-                    pygame.draw.circle(debugSurf, c, (int(sx), int(sy)), 3)
+                    pts_3d = POS_ALL.astype(np.float32)
+                    proj2d = project_3D_to_2D(pts_3d, None, debug_yaw, debug_pitch, debug_dist,
+                                             scr_w=RES*SCALE, scr_h=RES*SCALE)
+                    projected_points_2d = proj2d
+                    for i,(sx,sy) in enumerate(proj2d):
+                        if sx is None:
+                            continue
+                        c= (100,100,255)
+                        pygame.draw.circle(debugSurf, c, (int(sx), int(sy)), 3)
 
-                me_3d= cam_pos_np.astype(np.float32).reshape(1,3)
-                me2d= project_3D_to_2D(me_3d, None, debug_yaw, debug_pitch, debug_dist,
-                                       RES*SCALE, RES*SCALE)
-                if me2d[0][0] is not None:
-                    pygame.draw.circle(debugSurf, (255,50,50),
-                                       (int(me2d[0][0]), int(me2d[0][1])), 5)
+                    me_3d= cam_pos_np.astype(np.float32).reshape(1,3)
+                    me2d= project_3D_to_2D(me_3d, None, debug_yaw, debug_pitch, debug_dist,
+                                           RES*SCALE, RES*SCALE)
+                    if me2d[0][0] is not None:
+                        pygame.draw.circle(debugSurf, (255,50,50),
+                                           (int(me2d[0][0]), int(me2d[0][1])), 5)
+                    cached_debug_surface = debugSurf
+                    last_debug_signature = debug_signature
 
-                screen.blit(debugSurf, (RES*SCALE, 0))
+                screen.blit(cached_debug_surface, (RES*SCALE, 0))
 
             pygame.display.flip()
+            frame_idx += 1
 
+            if args.max_frames and frame_idx >= args.max_frames:
+                running = False
+
+    if args.save_frame is not None and frame_idx > 0:
+        pygame.image.save(screen, str(args.save_frame.expanduser()))
+        print(f"Saved frame to {args.save_frame.expanduser()}")
     pygame.quit()
 
 

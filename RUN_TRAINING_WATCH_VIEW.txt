@@ -1,0 +1,112 @@
+ViSOR Training / Watch / View Commands
+======================================
+
+Use these from /home/eric/Documents/ViSOR.
+
+Simple launchers
+----------------
+
+bash ./run_train.sh [run_name]
+bash ./watch_train.sh [run_name]
+bash ./view_latest.sh [run_name]
+
+Behavior:
+- all new outputs go into runs/<run_name>/
+- runs/latest points at the active/latest run
+- if you omit run_name for watch/view, they use runs/latest
+- if you omit run_name for training:
+  - it resumes runs/latest if that exists
+  - otherwise it creates a timestamped run folder
+
+Main folders inside each run:
+- checkpoint.pt
+- diag.jsonl
+- watch/latest.png
+- watch/history/
+- logs/
+- analysis/
+
+Most common usage:
+- bash ./run_train.sh
+- bash ./watch_train.sh
+- bash ./view_latest.sh
+
+1) Environment setup
+--------------------
+
+export MAMBA_ROOT_PREFIX=/home/eric/.local/share/visor-micromamba
+eval "$(/home/eric/.local/bin/micromamba shell hook -s bash)"
+micromamba activate visor-cu118
+export PYTHONNOUSERSITE=1
+cd /home/eric/Documents/ViSOR
+
+
+2) Pick a run name
+------------------
+
+export RUN=tri_transport_slab_sched_scratch_2000
+
+
+3) Start training
+-----------------
+
+Simple:
+
+bash ./run_train.sh
+
+Named run:
+
+bash ./run_train.sh my_run_name
+
+Resume latest but override step count:
+
+bash ./run_train.sh --extra-steps 4000
+
+
+4) Watch progress in another terminal
+-------------------------------------
+
+Run the environment setup again in a second terminal, then:
+
+bash ./watch_train.sh
+
+Or watch a specific run:
+
+bash ./watch_train.sh my_run_name
+
+What this does:
+- writes the current preview into runs/latest/watch/latest.png
+- saves a frame history in runs/latest/watch/history/
+
+
+5) Open the final model in the interactive viewer
+-------------------------------------------------
+
+bash ./view_latest.sh
+
+Or open a specific run:
+
+bash ./view_latest.sh my_run_name
+
+
+6) Optional: one-shot preview render from an existing checkpoint
+---------------------------------------------------------------
+
+bash ./watch_train.sh my_run_name --once
+
+
+7) Optional: evaluate after training
+------------------------------------
+
+python -s -m visor.analyze_three_ray \
+  --checkpoint /home/eric/Documents/ViSOR/runs/${RUN}/checkpoint.pt \
+  --renders-dir /home/eric/Documents/ViSOR/renders1 \
+  --split heldout \
+  --holdout-mode phi_bucket \
+  --holdout-every 8 \
+  --holdout-offset 0 \
+  --max-views 8 \
+  --gate-temperature 3 \
+  --hard-gate-temperature 0.75 \
+  --adaptive-router-strength 1.0 \
+  --output-json /home/eric/Documents/ViSOR/runs/${RUN}/analysis/heldout.json
